@@ -1,0 +1,344 @@
+# -*- coding: utf-8 -*-
+import tkinter
+import tkinter.messagebox
+import customtkinter
+import threading
+import subprocess
+import os
+import sys
+from tkinter import filedialog
+from queue import Queue, Empty
+import shutil # For finding ghostscript
+
+# --- Configuration ---
+# Try to find Ghostscript executable automatically
+def find_ghostscript_executable():
+    if sys.platform.startswith('win'):
+        # Common names for Windows Ghostscript command-line executable
+        common_names = ['gswin64c.exe', 'gswin32c.exe', 'gs.exe']
+    else:
+        # Common name for Linux/macOS
+        common_names = ['gs']
+
+    for name in common_names:
+        executable_path = shutil.which(name)
+        if executable_path:
+            print(f"Found Ghostscript: {executable_path}")
+            return executable_path
+    return None
+
+# --- !!! IMPORTANT: SET GHOSTSCRIPT PATH HERE IF NOT IN SYSTEM PATH !!! ---
+# If find_ghostscript_executable() returns None, uncomment and set the full path below
+# GHOSTSCRIPT_PATH = r"C:\Program Files\gs\gs10.03.1\bin\gswin64c.exe" # Example for Windows
+GHOSTSCRIPT_PATH = find_ghostscript_executable()
+# GHOSTSCRIPT_PATH = "/usr/local/bin/gs" # Example for Linux/macOS
+
+# Compression settings for Ghostscript (-dPDFSETTINGS)
+# /screen - low quality, small size (72 dpi)
+# /ebook - medium quality, moderate size (150 dpi)
+# /printer - high quality, larger size (300 dpi)
+# /prepress - high quality, color preservation (300 dpi)
+# /default - similar to /printer
+COMPRESSION_LEVELS = {
+    "低 (屏幕阅读)": "/screen",
+    "中 (电子书)": "/ebook",
+    "高 (打印)": "/printer",
+    "最高 (印前)": "/prepress"
+}
+
+# --- GUI Setup ---
+customtkinter.set_appearance_mode("Dark")  # Modes: "System" (default), "Dark", "Light"
+customtkinter.set_default_color_theme("dark-blue")  # Themes: "blue" (default), "green", "dark-blue"
+
+class App(customtkinter.CTk):
+    def __init__(self):
+        super().__init__()
+
+        # --- Window Setup ---
+        self.title("PDF 强效压缩工具 (基于 Ghostscript)")
+        self.geometry(f"{700}x{550}")
+
+        # --- State Variables ---
+        self.input_files = []
+        self.output_dir = ""
+        self.is_processing = False
+        self.status_queue = Queue() # Queue for thread communication
+
+        # --- Configure Grid Layout ---
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1) # Allow listbox to expand
+
+        # --- Widgets ---
+        # Input Frame
+        self.input_frame = customtkinter.CTkFrame(self)
+        self.input_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="nsew")
+        self.input_frame.grid_columnconfigure(1, weight=1)
+
+        self.select_files_button = customtkinter.CTkButton(self.input_frame, text="选择 PDF 文件", command=self.select_files)
+        self.select_files_button.grid(row=0, column=0, padx=10, pady=10)
+
+        self.selected_files_label = customtkinter.CTkLabel(self.input_frame, text="未选择文件", anchor="w")
+        self.selected_files_label.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+
+        # File Listbox
+        self.listbox_frame = customtkinter.CTkFrame(self)
+        self.listbox_frame.grid(row=1, column=0, padx=20, pady=10, sticky="nsew")
+        self.listbox_frame.grid_columnconfigure(0, weight=1)
+        self.listbox_frame.grid_rowconfigure(0, weight=1)
+
+        self.file_listbox = tkinter.Listbox(self.listbox_frame, selectmode=tkinter.EXTENDED, bg="#1a1a1a", fg="#dcdcdc", borderwidth=0, highlightthickness=0)
+        self.file_listbox.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
+        # Add Scrollbar (Needs adjustments for better CustomTkinter look if desired)
+        # list_scrollbar = customtkinter.CTkScrollbar(self.listbox_frame, command=self.file_listbox.yview)
+        # list_scrollbar.grid(row=0, column=1, sticky="ns")
+        # self.file_listbox.configure(yscrollcommand=list_scrollbar.set)
+
+
+        # Options Frame
+        self.options_frame = customtkinter.CTkFrame(self)
+        self.options_frame.grid(row=2, column=0, padx=20, pady=10, sticky="nsew")
+        self.options_frame.grid_columnconfigure(1, weight=1)
+        self.options_frame.grid_columnconfigure(3, weight=1) # Add weight to status label if needed
+
+        self.output_dir_button = customtkinter.CTkButton(self.options_frame, text="选择输出目录", command=self.select_output_dir)
+        self.output_dir_button.grid(row=0, column=0, padx=10, pady=10)
+
+        self.output_dir_label = customtkinter.CTkLabel(self.options_frame, text="未选择", anchor="w")
+        self.output_dir_label.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+
+        self.compression_label = customtkinter.CTkLabel(self.options_frame, text="压缩级别:", anchor="e")
+        self.compression_label.grid(row=1, column=0, padx=(10,0), pady=10, sticky="e")
+
+        self.compression_var = customtkinter.StringVar(value=list(COMPRESSION_LEVELS.keys())[1]) # Default to ebook
+        self.compression_menu = customtkinter.CTkOptionMenu(self.options_frame, values=list(COMPRESSION_LEVELS.keys()),
+                                                            variable=self.compression_var)
+        self.compression_menu.grid(row=1, column=1, padx=10, pady=10, sticky="w")
+
+
+        # Action Frame
+        self.action_frame = customtkinter.CTkFrame(self)
+        self.action_frame.grid(row=3, column=0, padx=20, pady=10, sticky="nsew")
+        self.action_frame.grid_columnconfigure(0, weight=1) # Center the button
+
+        self.compress_button = customtkinter.CTkButton(self.action_frame, text="开始压缩", command=self.start_compression, width=150, height=35)
+        self.compress_button.grid(row=0, column=0, padx=10, pady=10)
+
+        # Status Bar Frame
+        self.status_frame = customtkinter.CTkFrame(self, height=30)
+        self.status_frame.grid(row=4, column=0, padx=20, pady=(10, 20), sticky="nsew")
+        self.status_frame.grid_columnconfigure(0, weight=1)
+
+        self.status_label = customtkinter.CTkLabel(self.status_frame, text="状态：就绪", anchor="w")
+        self.status_label.grid(row=0, column=0, padx=10, pady=5, sticky="ew")
+
+        # --- Check Ghostscript on startup ---
+        if not GHOSTSCRIPT_PATH:
+            tkinter.messagebox.showerror("错误", "未能自动找到 Ghostscript 可执行文件 (gswin64c.exe 或 gs)。\n\n请确保已安装 Ghostscript 并将其添加到系统 PATH，或者在 Python 脚本顶部的 GHOSTSCRIPT_PATH 变量中手动指定完整路径。")
+            # Optionally disable compression button if GS not found
+            self.compress_button.configure(state="disabled", text="Ghostscript 未找到")
+
+
+        # --- Start periodic check of the status queue ---
+        self.check_status_queue()
+
+
+    # --- GUI Methods ---
+    def select_files(self):
+        if self.is_processing: return
+        files = filedialog.askopenfilenames(
+            title="选择要压缩的 PDF 文件",
+            filetypes=[("PDF Files", "*.pdf")]
+        )
+        if files:
+            self.input_files = list(files)
+            # 设置默认输出目录为第一个选择文件的目录
+            default_output_dir = os.path.dirname(self.input_files[0])
+            self.output_dir = default_output_dir
+            self.output_dir_label.configure(text=self.output_dir)
+            self.update_file_listbox()
+            self.selected_files_label.configure(text=f"已选择 {len(self.input_files)} 个文件")
+            self.update_status(f"已选择 {len(self.input_files)} 个文件，默认输出目录：{self.output_dir}")
+
+    def select_output_dir(self):
+        if self.is_processing: return
+        directory = filedialog.askdirectory(title="选择保存压缩文件的目录")
+        if directory:
+            self.output_dir = directory
+            self.output_dir_label.configure(text=self.output_dir)
+            self.update_status(f"输出目录: {self.output_dir}")
+
+    def update_file_listbox(self):
+        self.file_listbox.delete(0, tkinter.END)
+        for f in self.input_files:
+            self.file_listbox.insert(tkinter.END, os.path.basename(f)) # Show only filename
+
+    def update_status(self, message):
+        self.status_label.configure(text=f"状态: {message}")
+        # self.update_idletasks() # Force GUI update (use cautiously)
+
+    def check_status_queue(self):
+        """ Periodically check the queue for messages from worker threads. """
+        try:
+            while True: # Process all messages currently in the queue
+                message_type, message_content = self.status_queue.get_nowait()
+                if message_type == "status":
+                    self.update_status(message_content)
+                elif message_type == "error":
+                    tkinter.messagebox.showerror("压缩错误", message_content)
+                    self.update_status("出现错误")
+                elif message_type == "info":
+                     tkinter.messagebox.showinfo("提示", message_content)
+                elif message_type == "finished":
+                    self.compression_finished()
+                    self.update_status("所有文件处理完成！")
+                self.status_queue.task_done() # Mark task as done
+        except Empty:
+            pass # No messages currently in queue
+        finally:
+            # Schedule the next check
+             self.after(100, self.check_status_queue)
+
+
+    def set_ui_processing(self, is_processing):
+        """Enable/disable UI elements during processing."""
+        self.is_processing = is_processing
+        state = "disabled" if is_processing else "normal"
+        self.select_files_button.configure(state=state)
+        self.output_dir_button.configure(state=state)
+        self.compression_menu.configure(state=state)
+        self.compress_button.configure(state=state)
+        # Update button text during processing
+        if is_processing:
+            self.compress_button.configure(text="正在压缩...")
+        else:
+             self.compress_button.configure(text="开始压缩")
+
+
+    # --- Compression Logic ---
+    def start_compression(self):
+        if self.is_processing:
+            return # Avoid starting multiple times
+
+        if not GHOSTSCRIPT_PATH:
+             tkinter.messagebox.showerror("错误", "未配置 Ghostscript 路径，无法执行压缩。")
+             return
+
+        if not self.input_files:
+            tkinter.messagebox.showwarning("警告", "请先选择要压缩的 PDF 文件。")
+            return
+        if not self.output_dir:
+            tkinter.messagebox.showwarning("警告", "请先选择输出目录。")
+            return
+
+        if not os.path.exists(self.output_dir):
+             tkinter.messagebox.showerror("错误", f"输出目录不存在: {self.output_dir}")
+             return
+
+        self.set_ui_processing(True)
+        self.update_status("开始压缩任务...")
+
+        # Get selected compression level
+        level_key = self.compression_var.get()
+        pdf_settings = COMPRESSION_LEVELS[level_key]
+
+        # Create and start worker threads
+        self.threads = []
+        self.num_files_to_process = len(self.input_files)
+        self.files_processed_count = 0
+
+        for input_file in self.input_files:
+            thread = threading.Thread(target=self.compress_pdf_worker,
+                                      args=(input_file, self.output_dir, pdf_settings, GHOSTSCRIPT_PATH),
+                                      daemon=True) # Daemon threads exit when main program exits
+            self.threads.append(thread)
+            thread.start()
+
+    def compress_pdf_worker(self, input_path, output_dir, pdf_settings, gs_path):
+        """Worker function executed by each thread."""
+        filename = os.path.basename(input_path)
+        output_filename = f"{os.path.splitext(filename)[0]}_compressed.pdf"
+        output_path = os.path.join(output_dir, output_filename)
+
+        # Ensure output filename is unique if it already exists
+        counter = 1
+        while os.path.exists(output_path):
+            output_filename = f"{os.path.splitext(filename)[0]}_compressed_{counter}.pdf"
+            output_path = os.path.join(output_dir, output_filename)
+            counter += 1
+
+        # Send status update to main thread via queue
+        self.status_queue.put(("status", f"正在压缩: {filename}..."))
+
+        # Get original file size
+        original_size = os.path.getsize(input_path)
+
+        # Construct Ghostscript command
+        command = [
+            gs_path,
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",  # Or 1.5, 1.6 etc. if needed
+            f"-dPDFSETTINGS={pdf_settings}",
+            "-dNOPAUSE",
+            "-dQUIET", # Suppress informational messages from GS
+            "-dBATCH",
+            f"-sOutputFile={output_path}",
+            input_path
+        ]
+
+        try:
+            # Execute Ghostscript command
+            process = subprocess.run(command, capture_output=True, text=True, check=True, encoding='utf-8', errors='ignore')
+            # check=True will raise CalledProcessError if GS returns non-zero exit code
+
+            # Calculate compression ratio
+            compressed_size = os.path.getsize(output_path)
+            compression_ratio = (1 - compressed_size / original_size) * 100
+            size_before = original_size / (1024 * 1024)  # Convert to MB
+            size_after = compressed_size / (1024 * 1024)  # Convert to MB
+
+            # Report success with compression info
+            self.status_queue.put(("status", f"完成: {filename} -> {output_filename} (压缩前: {size_before:.2f}MB, 压缩后: {size_after:.2f}MB, 压缩率: {compression_ratio:.1f}%)"))
+
+        except FileNotFoundError:
+            # This error means the gs_path executable was not found
+            self.status_queue.put(("error", f"Ghostscript 命令未找到: '{gs_path}'. 请检查路径配置和 PATH 环境变量。"))
+            # Stop further processing as GS is missing
+            # Note: This error might better be handled before starting threads,
+            # but it's included here for robustness in case PATH changes.
+            # A more robust solution might use a shared flag to stop all threads.
+        except subprocess.CalledProcessError as e:
+            # Ghostscript returned an error
+            error_message = f"压缩 '{filename}' 时 Ghostscript 失败。\n"
+            error_message += f"命令: {' '.join(command)}\n"
+            error_message += f"返回码: {e.returncode}\n"
+            # Try to include stderr if it contains useful info
+            stderr_output = e.stderr.strip()
+            if stderr_output:
+                 error_message += f"错误输出:\n{stderr_output}"
+            else:
+                 # Sometimes errors are on stdout with -dQUIET removed, but let's keep it simple
+                 error_message += "没有详细的错误输出 (尝试移除 -dQUIET 参数以获取更多信息)。"
+
+            self.status_queue.put(("error", error_message))
+        except Exception as e:
+            # Catch other potential errors (permissions, etc.)
+            self.status_queue.put(("error", f"压缩 '{filename}' 时发生意外错误: {e}"))
+        finally:
+            # Atomically increment processed count and check if all done
+            with threading.Lock(): # Ensure thread-safe counter update
+                self.files_processed_count += 1
+                if self.files_processed_count == self.num_files_to_process:
+                    self.status_queue.put(("finished", "All tasks completed.")) # Signal completion
+
+
+    def compression_finished(self):
+        """Called when all worker threads have reported completion."""
+        self.set_ui_processing(False)
+        # Optionally show a final message box
+        # self.status_queue.put(("info", "所有选定的文件已处理完毕！"))
+
+
+# --- Run the App ---
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
